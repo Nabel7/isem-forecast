@@ -17,6 +17,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7.2", "ruff>=0.6", "pre-commit>=3.5"]
+# Pre-trained forecasting models (Chronos-2). Large: PyTorch and its friends, about 1 GB.
+foundation = ["chronos-forecasting>=2.3,<3"]
+notebooks = ["jupyter>=1.0", "matplotlib>=3.7"]
 
 [tool.setuptools.packages.find]
 include = ["isem_forecast*"]
