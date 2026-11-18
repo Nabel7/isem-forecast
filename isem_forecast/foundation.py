@@ -26,6 +26,14 @@ def load_model(device: str | None = None):
     `device` is "mps" (a Mac's graphics chip), "cuda" (an Nvidia card) or "cpu"; by
     default the fastest one available.
     """
+    # PyTorch and LightGBM each bring their own copy of OpenMP, the library that spreads
+    # work over several cores. On a Mac, if PyTorch's loads first, LightGBM crashes the
+    # moment it uses several cores. Loading LightGBM's first avoids that.
+    try:
+        import lightgbm  # noqa: F401
+    except ImportError:
+        pass
+
     # Imported here, not at the top, so the rest of the package works without the extra.
     import torch
     from chronos import Chronos2Pipeline

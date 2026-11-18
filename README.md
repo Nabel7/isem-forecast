@@ -48,7 +48,8 @@ isem_forecast/
 ├── baselines.py   # the simple forecasts above
 ├── evaluate.py    # walk-forward testing and scoring
 ├── foundation.py  # Chronos-2 as a forecaster, with optional covariates (needs the foundation extra)
-├── site.py        # runs the Chronos-2 tests and writes the data for Open Power Lab's forecast page
+├── gbm.py         # LightGBM: features known before the auction, refitted every day (needs the gbm extra)
+├── site.py        # runs the Chronos-2 and LightGBM tests and writes the data for Open Power Lab's forecast page
 └── __main__.py    # the command line: python -m isem_forecast
 ```
 
@@ -61,6 +62,7 @@ isem_forecast/
 
 - [01 Chronos-2, a first look](notebooks/01_chronos2_first_look.ipynb): Amazon's pre-trained forecasting model, given only the price history and no training. In the same day-by-day test, delivery days 14 Nov 2025 to 14 Nov 2026, its average miss was €28.7/MWh with 28 days of history (€28.4 with 90 days), against €37.5 for `week_average`. It was ahead in every month. Its 80% range held the actual price about 73% of the time, so it's a little overconfident. Its worst days are sudden price falls on windy days, which prices alone can't foresee. Needs `pip install -e ".[foundation,notebooks]"`.
 - [02 Chronos-2 with the wind forecast](notebooks/02_chronos2_with_wind.ipynb): the same model, also given EirGrid's wind forecast **as it stood before each auction**, built from every saved version of SEMO's per-farm forecasts. Delivery days 9 Sep to 14 Nov 2026 (67 days): average miss €36.5/MWh with wind, against €46.9 on prices alone and €66.3 for `week_average`. Using EirGrid's later, revised forecast would have scored €35.6: peeking flatters it only a little here. Giving it measured wind for the past instead of the forecast made it worse (€40.2).
+- [03 LightGBM against Chronos-2](notebooks/03_lightgbm_vs_chronos2.ipynb): a model fitted on Irish data alone (gradient-boosted trees, refitted every day on every day before), with the same inputs, on the same half-hours. Delivery days 9 Sep to 17 Nov 2026 (70 days): Chronos-2 + wind €36.3/MWh, LightGBM + wind €46.6, Chronos-2 on prices alone €47.3, LightGBM on prices alone €65.6, `week_average` €66.3. Over a year on prices alone: Chronos-2 €28.5, `week_average` €37.5, LightGBM €38.0. LightGBM's settings were fixed before testing, not tuned; its 80% range held only 47% of prices. Needs `pip install -e ".[foundation,gbm,notebooks]"`.
 
 ## What's next
 
@@ -69,7 +71,9 @@ From the [data exploration](https://github.com/Nabel7/isem-data/blob/main/notebo
 - [ ] A model using forecast wind and the calendar (hour, weekday)
 - [ ] A demand forecast, to use forecast net demand
 - [x] Forecasts as they stood at auction time, not later revisions (wind, notebook 02)
-- [ ] A proper statistical model (LightGBM or LEAR) on the same days, with the same wind forecast
+- [x] A model fitted on Irish data (LightGBM) on the same days, with the same wind forecast (notebook 03)
+- [ ] LEAR, the other standard competitor: a linear model with automatic selection of inputs
+- [ ] Chronos-2 and LightGBM averaged together
 - [ ] Gas prices, to follow level shifts like 2026's
 
 ## Development
