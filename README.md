@@ -40,6 +40,27 @@ python -m isem_forecast        # prints the results table and the error by month
 
 Use `--data-dir` if the data is somewhere else.
 
+## The morning forecast
+
+```bash
+pip install -e ".[foundation,gbm]"
+python -m isem_forecast.live --out forecasts/     # tomorrow's prices, from the archive as it stands now
+```
+
+Everything above looks back. `live.py` makes the forecast for real: run each morning before the 09:00 UTC cut-off, it writes `<day>.csv` (every half-hour: Chronos-2 + wind and LightGBM + wind with their 80% ranges, and `yesterday` and `week_average` as the bar to beat) and `<day>.json` (when it was made, whether that was before the cut-off, and exactly which prices and wind forecast went in). A day's forecast, once saved, is never replaced. It takes about 15 seconds.
+
+Two things are different live from the tests, both measured on the wind test's days (Sep to Nov 2026, about 70 days):
+
+| | Chronos-2 + wind | LightGBM + wind |
+|---|---|---|
+| As tested | €36.70 | €46.87 |
+| Yesterday's prices hourly, from ENTSO-E (SEMO only publishes them after the day) | €36.43 | €46.94 |
+| | | |
+| As tested (06:15 wind forecast on D-1) | €36.90 | €47.20 |
+| The wind forecast from the evening before, 12 hours older (SEMO lists each version about a day late) | €36.93 | €47.57 |
+
+Average miss, €/MWh. Neither costs anything that matters (Chronos-2 on prices alone, with no wind forecast, is €47.18), so the live forecasts can be read against the tests. The two pairs were run over slightly different days (72 and 71), so their "as tested" figures differ a little.
+
 ## How it works
 
 ```
@@ -50,6 +71,7 @@ isem_forecast/
 ├── foundation.py  # Chronos-2 as a forecaster, with optional covariates (needs the foundation extra)
 ├── gbm.py         # LightGBM: features known before the auction, refitted every day (needs the gbm extra)
 ├── site.py        # runs the Chronos-2 and LightGBM tests and writes the data for Open Power Lab's forecast page
+├── live.py        # the morning forecast: tomorrow's prices, before the auction
 └── __main__.py    # the command line: python -m isem_forecast
 ```
 
