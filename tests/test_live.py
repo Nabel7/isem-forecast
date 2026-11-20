@@ -1,10 +1,11 @@
 """Tests for the morning forecast, on a small made-up archive.
 
-Chronos-2 is replaced by a stand-in (as in test_foundation.py); LightGBM is the real one,
-fitted on the made-up month, which takes a second or two."""
+Chronos-2 and LightGBM are replaced by stand-ins (as in test_foundation.py and
+test_gbm.py), so the tests need neither model installed."""
 
 from datetime import date, timedelta
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -12,6 +13,19 @@ from isem_forecast import live
 
 DAY = date(2026, 11, 22)  # the delivery day forecast in these tests
 FIRST = DAY - timedelta(days=40)
+
+
+class FakeTrees:
+    """Stands in for LightGBM: always forecasts a change of +5 (range +1 to +9)."""
+
+    def __init__(self, objective, alpha, params):
+        self.alpha = alpha
+
+    def fit(self, features, target):
+        return self
+
+    def predict(self, features):
+        return np.full(len(features), {None: 5.0, 0.1: 1.0, 0.9: 9.0}[self.alpha])
 
 
 class FakeModel:
@@ -127,7 +141,7 @@ def test_not_ready_without_semo_for_the_day_before_yesterday(tmp_path):
 
 def test_the_forecast_has_every_method_for_every_half_hour(tmp_path):
     made = pd.Timestamp("2026-11-21 07:40", tz="UTC")
-    table, meta = live.make(DAY, archive(tmp_path), model=FakeModel(), now=made)
+    table, meta = live.make(DAY, archive(tmp_path), model=FakeModel(), make_gbm=FakeTrees, now=made)
 
     assert list(table.columns) == live.COLUMNS
     assert table.groupby("method").size().to_dict() == {m: 48 for m in live.METHODS}
@@ -142,17 +156,22 @@ def test_the_forecast_has_every_method_for_every_half_hour(tmp_path):
 
 def test_a_forecast_made_after_the_cut_off_says_so(tmp_path):
     late = pd.Timestamp("2026-11-21 09:05", tz="UTC")
-    _, meta = live.make(DAY, archive(tmp_path), model=FakeModel(), now=late)
+    _, meta = live.make(DAY, archive(tmp_path), model=FakeModel(), make_gbm=FakeTrees, now=late)
     assert meta["in_time"] is False
 
 
 def test_not_ready_without_a_wind_forecast_for_the_day(tmp_path):
     with pytest.raises(live.NotReady, match="wind forecast"):
-        live.make(DAY, archive(tmp_path, wind_to=DAY - timedelta(days=1)), model=FakeModel())
+        live.make(
+            DAY,
+            archive(tmp_path, wind_to=DAY - timedelta(days=1)),
+            model=FakeModel(),
+            make_gbm=FakeTrees,
+        )
 
 
 def test_a_saved_forecast_is_never_replaced(tmp_path):
-    table, meta = live.make(DAY, archive(tmp_path), model=FakeModel())
+    table, meta = live.make(DAY, archive(tmp_path), model=FakeModel(), make_gbm=FakeTrees)
     out = tmp_path / "forecasts"
     live.save(table, meta, out)
     with pytest.raises(FileExistsError, match="never replaced"):

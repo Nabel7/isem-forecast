@@ -112,8 +112,13 @@ def history_before(day: date, data_dir: Path = DATA_DIR) -> tuple[pd.Series, dic
     }
 
 
-def make(day: date, data_dir: Path = DATA_DIR, model=None, now=None) -> tuple[pd.DataFrame, dict]:
-    """The forecast for `day`: a table (COLUMNS) and what went into it."""
+def make(
+    day: date, data_dir: Path = DATA_DIR, model=None, now=None, make_gbm=None
+) -> tuple[pd.DataFrame, dict]:
+    """The forecast for `day`: a table (COLUMNS) and what went into it.
+
+    `model` is Chronos-2 (loaded if not given) and `make_gbm` builds LightGBM's models
+    (LightGBM's own if not given); tests pass stand-ins for both."""
     # Imported here so the package's other commands work without these extras installed.
     from .foundation import Chronos2, load_model
     from .gbm import LightGBM
@@ -132,7 +137,7 @@ def make(day: date, data_dir: Path = DATA_DIR, model=None, now=None) -> tuple[pd
     known = honest["forecast_mw"]
 
     chronos = Chronos2(model or load_model(), CONTEXT_DAYS, {"wind": known})
-    gbm = LightGBM(known)
+    gbm = LightGBM(known, make_model=make_gbm)
     parts = []
     for name, forecaster in [("chronos2_wind", chronos), ("lightgbm_wind", gbm)]:
         forecaster(history, targets)
