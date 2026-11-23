@@ -19,6 +19,12 @@ What it uses, as it stands on the morning of D-1 (the day before delivery day D)
   only lists each version about a day late, so live this is usually the version from the
   evening of D-2, where the tests mostly had the one from 06:15 on D-1. Twelve hours older
   costs almost nothing (see the README). The version used is recorded with the forecast.
+  If no version covers all of D, the forecast waits for one until three hours before the
+  cut-off (WITHOUT_WIND_FROM), in case SEMO lists one in time. From then on it is made
+  without wind: the two wind models give no forecast (left empty, and listed in the
+  .json), and yesterday and week_average are still saved. Such a day is shown but never
+  counts towards the score. (On 23 Nov 2026 SEMO had listed no new version for two and
+  a half days.)
 
 It writes two files to --out, named after the day:
 
@@ -57,6 +63,12 @@ CONTEXT_DAYS = 28  # as in the tests (site.py)
 # The methods, in the order they're written. The two baselines are the bar to beat.
 METHODS = ["chronos2_wind", "lightgbm_wind", "yesterday", "week_average"]
 COLUMNS = ["timestamp_utc", "method", "low", "median", "high"]
+
+
+# With no wind forecast for the day, the forecast waits for one until this long before
+# the cut-off, then is made without it (see the top of this file).
+WITHOUT_WIND_FROM = pd.Timedelta(hours=3)
+WIND_METHODS = ["chronos2_wind", "lightgbm_wind"]
 
 
 class NotReady(RuntimeError):
@@ -119,34 +131,41 @@ def make(
 
     `model` is Chronos-2 (loaded if not given) and `make_gbm` builds LightGBM's models
     (LightGBM's own if not given); tests pass stand-ins for both."""
-    # Imported here so the package's other commands work without these extras installed.
-    from .foundation import Chronos2, load_model
-    from .gbm import LightGBM
-
     now = now or pd.Timestamp.now(tz="UTC")
+    cutoff = auction_cutoff(day)
     targets = half_hours_of(day)
     history, prices_used = history_before(day, data_dir)
 
     honest = wind_forecast_before_auction(data_dir)
     wind_for_day = honest.reindex(targets)
-    if wind_for_day["forecast_mw"].isna().any():
+    have_wind = not wind_for_day["forecast_mw"].isna().any()
+    if not have_wind and now < cutoff - WITHOUT_WIND_FROM:
         raise NotReady(
-            f"no wind forecast for {day} published by {auction_cutoff(day):%Y-%m-%d %H:%M} UTC "
-            "is in the archive yet"
+            f"no wind forecast for {day} published by {cutoff:%Y-%m-%d %H:%M} UTC is in the "
+            f"archive yet; from {cutoff - WITHOUT_WIND_FROM:%H:%M} UTC the forecast is made "
+            "without it"
         )
-    known = honest["forecast_mw"]
 
-    chronos = Chronos2(model or load_model(), CONTEXT_DAYS, {"wind": known})
-    gbm = LightGBM(known, make_model=make_gbm)
+    empty = pd.DataFrame(
+        {"low": float("nan"), "median": float("nan"), "high": float("nan")}, index=targets
+    )
     parts = []
-    for name, forecaster in [("chronos2_wind", chronos), ("lightgbm_wind", gbm)]:
-        forecaster(history, targets)
-        band = forecaster.ranges().reindex(targets) if forecaster.forecasts else None
-        if band is None:  # the model declined (a gap in its inputs): say so, don't guess
-            band = pd.DataFrame(
-                {"low": float("nan"), "median": float("nan"), "high": float("nan")}, index=targets
-            )
-        parts.append(band.assign(method=name))
+    if have_wind:
+        # Imported here so the package's other commands work without these extras installed.
+        from .foundation import Chronos2, load_model
+        from .gbm import LightGBM
+
+        known = honest["forecast_mw"]
+        chronos = Chronos2(model or load_model(), CONTEXT_DAYS, {"wind": known})
+        gbm = LightGBM(known, make_model=make_gbm)
+        for name, forecaster in [("chronos2_wind", chronos), ("lightgbm_wind", gbm)]:
+            forecaster(history, targets)
+            band = forecaster.ranges().reindex(targets) if forecaster.forecasts else None
+            if band is None:  # the model declined (a gap in its inputs): say so, don't guess
+                band = empty
+            parts.append(band.assign(method=name))
+    else:  # no wind forecast by now: the wind models give none, the rest still count
+        parts += [empty.assign(method=name) for name in WIND_METHODS]
     for name in ["yesterday", "week_average"]:
         median = BASELINES[name](history, targets)
         parts.append(
@@ -156,13 +175,14 @@ def make(
         )
     table = pd.concat(parts).rename_axis("timestamp_utc").reset_index()[COLUMNS]
 
-    cutoff = auction_cutoff(day)
     meta = {
         "day": str(day),
         "made_at_utc": f"{now:%Y-%m-%dT%H:%M:%SZ}",
         "cutoff_utc": f"{cutoff:%Y-%m-%dT%H:%MZ}",
         "in_time": bool(now <= cutoff),
-        "wind_forecast_published_utc": f"{wind_for_day['published_utc'].iloc[0]:%Y-%m-%dT%H:%MZ}",
+        "wind_forecast_published_utc": (
+            f"{wind_for_day['published_utc'].iloc[0]:%Y-%m-%dT%H:%MZ}" if have_wind else None
+        ),
         **prices_used,
         "methods_without_forecast": sorted(
             m for m in METHODS if table.loc[table["method"] == m, "median"].isna().any()
@@ -234,7 +254,12 @@ def main() -> None:
     late = "" if meta["in_time"] else f" (LATE: after the {meta['cutoff_utc']} cut-off)"
     medians = table.groupby("method")["median"].mean().reindex(METHODS)
     print(f"{day}: saved {csv}{late}")
-    print("Average forecast, €/MWh: " + ", ".join(f"{m} {v:.2f}" for m, v in medians.items()))
+    if meta["wind_forecast_published_utc"] is None:
+        print("No wind forecast: saved without the wind models, so this day won't count.")
+    print(
+        "Average forecast, €/MWh: "
+        + ", ".join(f"{m} {v:.2f}" if v == v else f"{m} none" for m, v in medians.items())
+    )
 
 
 if __name__ == "__main__":

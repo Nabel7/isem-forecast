@@ -160,14 +160,54 @@ def test_a_forecast_made_after_the_cut_off_says_so(tmp_path):
     assert meta["in_time"] is False
 
 
-def test_not_ready_without_a_wind_forecast_for_the_day(tmp_path):
+def test_without_a_wind_forecast_it_waits_until_three_hours_before_the_cut_off(tmp_path):
+    early = pd.Timestamp("2026-11-21 05:59", tz="UTC")  # the cut-off is 09:00
     with pytest.raises(live.NotReady, match="wind forecast"):
         live.make(
             DAY,
             archive(tmp_path, wind_to=DAY - timedelta(days=1)),
             model=FakeModel(),
             make_gbm=FakeTrees,
+            now=early,
         )
+
+
+@pytest.mark.parametrize("made", ["2026-11-21 06:00", "2026-11-21 08:59", "2026-11-21 10:00"])
+def test_then_it_is_made_without_the_wind_models(tmp_path, made):
+    def no_model():
+        raise AssertionError("Chronos-2 shouldn't be loaded without a wind forecast")
+
+    table, meta = live.make(
+        DAY,
+        archive(tmp_path, wind_to=DAY - timedelta(days=1)),
+        model=None,
+        make_gbm=no_model,
+        now=pd.Timestamp(made, tz="UTC"),
+    )
+    assert table.groupby("method").size().to_dict() == {m: 48 for m in live.METHODS}
+    by_method = table.groupby("method")["median"]
+    assert by_method.count().to_dict() == {
+        "chronos2_wind": 0,
+        "lightgbm_wind": 0,
+        "yesterday": 48,
+        "week_average": 48,
+    }
+    assert meta["methods_without_forecast"] == ["chronos2_wind", "lightgbm_wind"]
+    assert meta["wind_forecast_published_utc"] is None
+    assert meta["in_time"] is (made < "2026-11-21 09:00")
+
+
+def test_a_forecast_without_wind_saves_with_empty_wind_columns(tmp_path):
+    table, meta = live.make(
+        DAY,
+        archive(tmp_path, wind_to=DAY - timedelta(days=1)),
+        now=pd.Timestamp("2026-11-21 07:00", tz="UTC"),
+    )
+    csv, info = live.save(table, meta, tmp_path / "forecasts")
+    saved = pd.read_csv(csv)
+    assert saved.loc[saved["method"] == "chronos2_wind", "median"].isna().all()
+    assert saved.loc[saved["method"] == "week_average", "median"].notna().all()
+    assert '"wind_forecast_published_utc": null' in info.read_text()
 
 
 def test_a_saved_forecast_is_never_replaced(tmp_path):

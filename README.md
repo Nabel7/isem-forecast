@@ -49,6 +49,8 @@ python -m isem_forecast.live --out forecasts/     # tomorrow's prices, from the 
 
 Everything above looks back. `live.py` makes the forecast for real: run each morning before the 09:00 UTC cut-off, it writes `<day>.csv` (every half-hour: Chronos-2 + wind and LightGBM + wind with their 80% ranges, and `yesterday` and `week_average` as the bar to beat) and `<day>.json` (when it was made, whether that was before the cut-off, and exactly which prices and wind forecast went in). A day's forecast, once saved, is never replaced. It takes about 15 seconds.
 
+If no wind forecast for the day is in the archive, it waits ("not ready") until three hours before the cut-off, in case SEMO lists one in time, and from then on saves the forecast without it: the two wind models are left empty and listed in the `.json`, and `yesterday` and `week_average` are still saved. Such a day is shown but never counts towards the score. This first happened for 24 Nov 2026, when SEMO had listed no new wind forecast for two and a half days.
+
 Two things are different live from the tests, both measured on the wind test's days (Sep to Nov 2026, about 70 days):
 
 | | Chronos-2 + wind | LightGBM + wind |
