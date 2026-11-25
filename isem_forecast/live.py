@@ -21,10 +21,12 @@ What it uses, as it stands on the morning of D-1 (the day before delivery day D)
   costs almost nothing (see the README). The version used is recorded with the forecast.
   If no version covers all of D, the forecast waits for one until three hours before the
   cut-off (WITHOUT_WIND_FROM), in case SEMO lists one in time. From then on it is made
-  without wind: the two wind models give no forecast (left empty, and listed in the
-  .json), and yesterday and week_average are still saved. Such a day is shown but never
-  counts towards the score. (On 23 Nov 2026 SEMO had listed no new version for two and
-  a half days.)
+  with the backup, ENTSO-E's wind forecast (backup_wind.py: values first seen by then,
+  scaled to SEMO's level), and counts like any other day; `wind_source` in the .json
+  says which was used. With neither, it's made without wind: the two wind models give no
+  forecast (left empty, and listed in the .json), and yesterday and week_average are
+  still saved. Such a day is shown but never counts towards the score. (SEMO listed no
+  new version for two days or more on 20-23 Nov and again from 23 Nov 2026.)
 
 It writes two files to --out, named after the day:
 
@@ -48,6 +50,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from .backup_wind import entsoe_backup
 from .baselines import BASELINES
 from .data import (
     DATA_DIR,
@@ -142,9 +145,22 @@ def make(
     if not have_wind and now < cutoff - WITHOUT_WIND_FROM:
         raise NotReady(
             f"no wind forecast for {day} published by {cutoff:%Y-%m-%d %H:%M} UTC is in the "
-            f"archive yet; from {cutoff - WITHOUT_WIND_FROM:%H:%M} UTC the forecast is made "
-            "without it"
+            f"archive yet; from {cutoff - WITHOUT_WIND_FROM:%H:%M} UTC ENTSO-E's is used "
+            "instead, if it has one, or else the forecast is made without wind"
         )
+    known = honest["forecast_mw"]
+    wind_used = {
+        "wind_source": "SEMO" if have_wind else None,
+        "wind_forecast_published_utc": (
+            f"{wind_for_day['published_utc'].iloc[0]:%Y-%m-%dT%H:%MZ}" if have_wind else None
+        ),
+    }
+    if not have_wind:
+        backup = entsoe_backup(targets, known, min(now, cutoff), data_dir)
+        if backup is not None:
+            values, wind_used = backup
+            known = values.combine_first(known.drop(targets, errors="ignore")).sort_index()
+            have_wind = True
 
     empty = pd.DataFrame(
         {"low": float("nan"), "median": float("nan"), "high": float("nan")}, index=targets
@@ -155,7 +171,6 @@ def make(
         from .foundation import Chronos2, load_model
         from .gbm import LightGBM
 
-        known = honest["forecast_mw"]
         chronos = Chronos2(model or load_model(), CONTEXT_DAYS, {"wind": known})
         gbm = LightGBM(known, make_model=make_gbm)
         for name, forecaster in [("chronos2_wind", chronos), ("lightgbm_wind", gbm)]:
@@ -180,9 +195,7 @@ def make(
         "made_at_utc": f"{now:%Y-%m-%dT%H:%M:%SZ}",
         "cutoff_utc": f"{cutoff:%Y-%m-%dT%H:%MZ}",
         "in_time": bool(now <= cutoff),
-        "wind_forecast_published_utc": (
-            f"{wind_for_day['published_utc'].iloc[0]:%Y-%m-%dT%H:%MZ}" if have_wind else None
-        ),
+        **wind_used,
         **prices_used,
         "methods_without_forecast": sorted(
             m for m in METHODS if table.loc[table["method"] == m, "median"].isna().any()
@@ -256,6 +269,8 @@ def main() -> None:
     print(f"{day}: saved {csv}{late}")
     if meta["wind_forecast_published_utc"] is None:
         print("No wind forecast: saved without the wind models, so this day won't count.")
+    elif meta["wind_source"] != "SEMO":
+        print(f"SEMO's wind forecast was missing: used the backup, {meta['wind_source']}.")
     print(
         "Average forecast, €/MWh: "
         + ", ".join(f"{m} {v:.2f}" if v == v else f"{m} none" for m, v in medians.items())

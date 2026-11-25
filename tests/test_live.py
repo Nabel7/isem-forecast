@@ -217,3 +217,85 @@ def test_a_saved_forecast_is_never_replaced(tmp_path):
     with pytest.raises(FileExistsError, match="never replaced"):
         live.save(table, meta, out)
     assert sorted(p.name for p in out.iterdir()) == ["2026-11-22.csv", "2026-11-22.json"]
+
+
+# --- the backup wind forecast (ENTSO-E's) ---
+
+
+def entsoe_wind(data_dir, first_seen, ie_to=DAY, ni_to=DAY, ie=1000.0, ni=250.0):
+    """ENTSO-E's wind forecast as isem-data saves it: hourly, per region, each value first
+    seen at `first_seen`, for every day from FIRST to `ie_to` (Ireland) and `ni_to` (NI)."""
+    rows = []
+    for region, last, mw in [("IE", ie_to, ie), ("NI", ni_to, ni)]:
+        for d in range((last - FIRST).days + 1):
+            for t in live.half_hours_of(FIRST + timedelta(days=d)):
+                if t.minute == 0:
+                    rows.append((pd.Timestamp(first_seen, tz="UTC"), t, region, mw))
+    pd.DataFrame(
+        rows, columns=["first_seen_utc", "timestamp_utc", "region", "forecast_mw"]
+    ).to_parquet(data_dir / "entsoe_wind_forecasts.parquet")
+    return data_dir
+
+
+def test_without_semos_wind_it_uses_entsoes_and_the_day_counts(tmp_path):
+    data = archive(tmp_path, wind_to=DAY - timedelta(days=1))
+    entsoe_wind(data, first_seen="2026-11-20 19:00")
+    table, meta = live.make(
+        DAY,
+        data,
+        model=FakeModel(),
+        make_gbm=FakeTrees,
+        now=pd.Timestamp("2026-11-21 06:30", tz="UTC"),
+    )
+    assert meta["methods_without_forecast"] == []  # so it counts
+    assert meta["wind_source"] == "ENTSO-E"
+    assert meta["wind_forecast_published_utc"] == "2026-11-20T19:00Z"  # when it was first seen
+    assert meta["entsoe_scale_to_semo"] == 1.2  # SEMO's 1,500 MW against ENTSO-E's 1,250
+    assert table.groupby("method")["median"].count().to_dict() == {m: 48 for m in live.METHODS}
+
+
+def test_the_backup_is_scaled_and_northern_ireland_estimated_when_missing(tmp_path):
+    data = archive(tmp_path, wind_to=DAY - timedelta(days=1))
+    entsoe_wind(data, first_seen="2026-11-20 19:00", ni_to=DAY - timedelta(days=1))
+    targets = live.half_hours_of(DAY)
+    semo = live.wind_forecast_before_auction(data)["forecast_mw"]
+    values, info = live.entsoe_backup(
+        targets, semo, pd.Timestamp("2026-11-21 06:30", tz="UTC"), data
+    )
+    assert info["wind_source"] == "ENTSO-E (Northern Ireland estimated)"
+    assert info["entsoe_ni_estimated"] is True
+    assert len(values) == 48 and values.round(6).eq(1500.0).all()  # (1000 + 1000 x 0.25) x 1.2
+
+
+def test_backup_values_first_seen_after_the_cut_off_are_not_used(tmp_path):
+    data = archive(tmp_path, wind_to=DAY - timedelta(days=1))
+    entsoe_wind(data, first_seen="2026-11-21 09:30")  # after the 09:00 cut-off
+    _, meta = live.make(DAY, data, now=pd.Timestamp("2026-11-21 10:00", tz="UTC"))
+    assert meta["wind_forecast_published_utc"] is None
+    assert meta["methods_without_forecast"] == ["chronos2_wind", "lightgbm_wind"]
+
+
+def test_it_still_waits_for_semo_until_three_hours_before_the_cut_off(tmp_path):
+    data = archive(tmp_path, wind_to=DAY - timedelta(days=1))
+    entsoe_wind(data, first_seen="2026-11-20 19:00")
+    with pytest.raises(live.NotReady, match="ENTSO-E"):
+        live.make(
+            DAY,
+            data,
+            model=FakeModel(),
+            make_gbm=FakeTrees,
+            now=pd.Timestamp("2026-11-21 05:00", tz="UTC"),
+        )
+
+
+def test_semos_wind_is_used_when_it_is_there(tmp_path):
+    data = archive(tmp_path)
+    entsoe_wind(data, first_seen="2026-11-20 19:00")
+    _, meta = live.make(
+        DAY,
+        data,
+        model=FakeModel(),
+        make_gbm=FakeTrees,
+        now=pd.Timestamp("2026-11-21 07:00", tz="UTC"),
+    )
+    assert meta["wind_source"] == "SEMO"
