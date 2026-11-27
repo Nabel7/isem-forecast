@@ -43,6 +43,7 @@ def archive(
     """A data folder like isem-data's: SEMO's prices to `semo_to`, ENTSO-E's hours to
     `entsoe_to`, and a wind forecast version published at 06:14 UTC the day before each
     day to `wind_to`."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
     days = lambda last: [FIRST + timedelta(days=i) for i in range((last - FIRST).days + 1)]  # noqa: E731
     times = pd.DatetimeIndex([t for d in days(semo_to) for t in live.half_hours_of(d)])
     pd.DataFrame(
@@ -160,20 +161,8 @@ def test_a_forecast_made_after_the_cut_off_says_so(tmp_path):
     assert meta["in_time"] is False
 
 
-def test_without_a_wind_forecast_it_waits_until_three_hours_before_the_cut_off(tmp_path):
-    early = pd.Timestamp("2026-11-21 05:59", tz="UTC")  # the cut-off is 09:00
-    with pytest.raises(live.NotReady, match="wind forecast"):
-        live.make(
-            DAY,
-            archive(tmp_path, wind_to=DAY - timedelta(days=1)),
-            model=FakeModel(),
-            make_gbm=FakeTrees,
-            now=early,
-        )
-
-
-@pytest.mark.parametrize("made", ["2026-11-21 06:00", "2026-11-21 08:59", "2026-11-21 10:00"])
-def test_then_it_is_made_without_the_wind_models(tmp_path, made):
+@pytest.mark.parametrize("made", ["2026-11-21 02:00", "2026-11-21 08:59", "2026-11-21 10:00"])
+def test_without_any_wind_forecast_it_is_made_at_once_without_the_wind_models(tmp_path, made):
     def no_model():
         raise AssertionError("Chronos-2 shouldn't be loaded without a wind forecast")
 
@@ -210,12 +199,21 @@ def test_a_forecast_without_wind_saves_with_empty_wind_columns(tmp_path):
     assert '"wind_forecast_published_utc": null' in info.read_text()
 
 
-def test_a_saved_forecast_is_never_replaced(tmp_path):
-    table, meta = live.make(DAY, archive(tmp_path), model=FakeModel(), make_gbm=FakeTrees)
+def test_a_forecast_with_semos_wind_is_never_replaced(tmp_path):
+    table, meta = live.make(
+        DAY,
+        archive(tmp_path),
+        model=FakeModel(),
+        make_gbm=FakeTrees,
+        now=pd.Timestamp("2026-11-21 03:00", tz="UTC"),
+    )
     out = tmp_path / "forecasts"
     live.save(table, meta, out)
-    with pytest.raises(FileExistsError, match="never replaced"):
-        live.save(table, meta, out)
+    assert not live.can_improve(
+        live.saved_meta(DAY, out), pd.Timestamp("2026-11-21 04:00", tz="UTC")
+    )
+    with pytest.raises(FileExistsError, match="better wind input"):
+        live.save(table, {**meta, "made_at_utc": "2026-11-21T04:00:00Z"}, out)
     assert sorted(p.name for p in out.iterdir()) == ["2026-11-22.csv", "2026-11-22.json"]
 
 
@@ -275,17 +273,17 @@ def test_backup_values_first_seen_after_the_cut_off_are_not_used(tmp_path):
     assert meta["methods_without_forecast"] == ["chronos2_wind", "lightgbm_wind"]
 
 
-def test_it_still_waits_for_semo_until_three_hours_before_the_cut_off(tmp_path):
+def test_the_backup_is_used_at_once_however_early(tmp_path):
     data = archive(tmp_path, wind_to=DAY - timedelta(days=1))
     entsoe_wind(data, first_seen="2026-11-20 19:00")
-    with pytest.raises(live.NotReady, match="ENTSO-E"):
-        live.make(
-            DAY,
-            data,
-            model=FakeModel(),
-            make_gbm=FakeTrees,
-            now=pd.Timestamp("2026-11-21 05:00", tz="UTC"),
-        )
+    _, meta = live.make(
+        DAY,
+        data,
+        model=FakeModel(),
+        make_gbm=FakeTrees,
+        now=pd.Timestamp("2026-11-21 02:00", tz="UTC"),
+    )
+    assert meta["wind_source"] == "ENTSO-E"
 
 
 def test_semos_wind_is_used_when_it_is_there(tmp_path):
@@ -299,3 +297,76 @@ def test_semos_wind_is_used_when_it_is_there(tmp_path):
         now=pd.Timestamp("2026-11-21 07:00", tz="UTC"),
     )
     assert meta["wind_source"] == "SEMO"
+
+
+# --- save early, replace later ---
+
+
+def forecast(data, made):
+    return live.make(
+        DAY, data, model=FakeModel(), make_gbm=FakeTrees, now=pd.Timestamp(made, tz="UTC")
+    )
+
+
+def test_a_backup_forecast_is_replaced_before_the_cut_off_once_semos_wind_arrives(tmp_path):
+    out = tmp_path / "forecasts"
+    early = archive(tmp_path / "early", wind_to=DAY - timedelta(days=1))
+    entsoe_wind(early, first_seen="2026-11-20 19:00")
+    live.save(*forecast(early, "2026-11-21 02:20"), out)
+    assert live.can_improve(live.saved_meta(DAY, out), pd.Timestamp("2026-11-21 06:00", tz="UTC"))
+
+    later = archive(tmp_path / "later")  # SEMO's wind forecast is in by now
+    _, info = live.save(*forecast(later, "2026-11-21 06:30"), out)
+    saved = live.saved_meta(DAY, out)
+    assert saved["wind_source"] == "SEMO" and saved["in_time"] is True
+    assert saved["replaced"] == [{"made_at_utc": "2026-11-21T02:20:00Z", "wind_input": "ENTSO-E"}]
+    assert not live.can_improve(saved, pd.Timestamp("2026-11-21 07:00", tz="UTC"))
+
+
+def test_none_is_replaced_by_entsoe_and_then_by_semo_and_both_are_listed(tmp_path):
+    out = tmp_path / "forecasts"
+    live.save(
+        *forecast(archive(tmp_path / "a", wind_to=DAY - timedelta(days=1)), "2026-11-21 02:00"), out
+    )
+    backup = archive(tmp_path / "b", wind_to=DAY - timedelta(days=1))
+    entsoe_wind(backup, first_seen="2026-11-21 03:00")
+    live.save(*forecast(backup, "2026-11-21 04:00"), out)
+    live.save(*forecast(archive(tmp_path / "c"), "2026-11-21 08:00"), out)
+    assert [r["wind_input"] for r in live.saved_meta(DAY, out)["replaced"]] == ["none", "ENTSO-E"]
+
+
+def test_a_forecast_no_better_than_the_saved_one_does_not_replace_it(tmp_path):
+    out = tmp_path / "forecasts"
+    data = archive(tmp_path / "a", wind_to=DAY - timedelta(days=1))
+    entsoe_wind(data, first_seen="2026-11-20 19:00")
+    live.save(*forecast(data, "2026-11-21 02:00"), out)
+    with pytest.raises(FileExistsError):
+        live.save(*forecast(data, "2026-11-21 05:00"), out)  # ENTSO-E again: same input
+    assert "replaced" not in live.saved_meta(DAY, out)
+
+
+def test_nothing_is_replaced_after_the_cut_off(tmp_path):
+    out = tmp_path / "forecasts"
+    live.save(
+        *forecast(archive(tmp_path / "a", wind_to=DAY - timedelta(days=1)), "2026-11-21 02:00"), out
+    )
+    assert not live.can_improve(
+        live.saved_meta(DAY, out), pd.Timestamp("2026-11-21 09:00", tz="UTC")
+    )
+    with pytest.raises(FileExistsError):
+        live.save(*forecast(archive(tmp_path / "b"), "2026-11-21 09:30"), out)
+    assert live.saved_meta(DAY, out)["wind_forecast_published_utc"] is None
+
+
+def test_forecasts_saved_before_wind_source_was_recorded_count_as_semos():
+    assert live.wind_input({"wind_forecast_published_utc": "2026-11-21T06:14Z"}) == "SEMO"
+    assert live.wind_input({"wind_forecast_published_utc": None}) == "none"
+    assert (
+        live.wind_input(
+            {
+                "wind_forecast_published_utc": "x",
+                "wind_source": "ENTSO-E (Northern Ireland estimated)",
+            }
+        )
+        == "ENTSO-E"
+    )

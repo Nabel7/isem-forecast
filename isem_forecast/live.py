@@ -19,14 +19,13 @@ What it uses, as it stands on the morning of D-1 (the day before delivery day D)
   only lists each version about a day late, so live this is usually the version from the
   evening of D-2, where the tests mostly had the one from 06:15 on D-1. Twelve hours older
   costs almost nothing (see the README). The version used is recorded with the forecast.
-  If no version covers all of D, the forecast waits for one until three hours before the
-  cut-off (WITHOUT_WIND_FROM), in case SEMO lists one in time. From then on it is made
-  with the backup, ENTSO-E's wind forecast (backup_wind.py: values first seen by then,
-  scaled to SEMO's level), and counts like any other day; `wind_source` in the .json
-  says which was used. With neither, it's made without wind: the two wind models give no
-  forecast (left empty, and listed in the .json), and yesterday and week_average are
-  still saved. Such a day is shown but never counts towards the score. (SEMO listed no
-  new version for two days or more on 20-23 Nov and again from 23 Nov 2026.)
+  If no version covers all of D, it's made at once with the backup, ENTSO-E's wind
+  forecast (backup_wind.py: values first seen by then, scaled to SEMO's level), and
+  counts like any other day; `wind_source` in the .json says which was used. With
+  neither, it's made without wind: the two wind models give no forecast (left empty, and
+  listed in the .json), and yesterday and week_average are still saved. Such a day is
+  shown but never counts towards the score. (SEMO listed no new version for two days or
+  more on 20-23 Nov and again from 23 Nov 2026.)
 
 It writes two files to --out, named after the day:
 
@@ -36,8 +35,15 @@ It writes two files to --out, named after the day:
     2026-11-22.json   when it was made, the cut-off, whether it was made in time, which
                       wind forecast and prices went in, and the versions of the models
 
-A forecast already saved for that day is never replaced: the record is only worth
-something if nothing in it can be redone after the fact.
+Save early, replace later. GitHub starts the overnight runs hours late, at times no one
+can predict, so the first run that can make a forecast saves one, even with the backup
+wind or none. A later run before the cut-off replaces it only if it has a better wind
+input (WIND_INPUTS: none, then ENTSO-E's, then SEMO's), and the .json lists what it
+replaced (`replaced`). Which forecast stands is decided by the input alone, never by the
+prices forecast, and nothing is replaced after the cut-off: the record is only worth
+something if nothing in it can be redone after the fact. (On 26 Nov 2026 the runs came
+at 02:23, 03:43, 05:21 and 09:47 UTC, none in the hours when the old rule allowed the
+backup, and 27 Nov got no forecast.)
 """
 
 import argparse
@@ -68,10 +74,11 @@ METHODS = ["chronos2_wind", "lightgbm_wind", "yesterday", "week_average"]
 COLUMNS = ["timestamp_utc", "method", "low", "median", "high"]
 
 
-# With no wind forecast for the day, the forecast waits for one until this long before
-# the cut-off, then is made without it (see the top of this file).
-WITHOUT_WIND_FROM = pd.Timedelta(hours=3)
 WIND_METHODS = ["chronos2_wind", "lightgbm_wind"]
+
+# The wind inputs, worst first. A saved forecast is replaced before the cut-off only by one
+# with a better input (see the top of this file).
+WIND_INPUTS = ["none", "ENTSO-E", "SEMO"]
 
 
 class NotReady(RuntimeError):
@@ -142,12 +149,6 @@ def make(
     honest = wind_forecast_before_auction(data_dir)
     wind_for_day = honest.reindex(targets)
     have_wind = not wind_for_day["forecast_mw"].isna().any()
-    if not have_wind and now < cutoff - WITHOUT_WIND_FROM:
-        raise NotReady(
-            f"no wind forecast for {day} published by {cutoff:%Y-%m-%d %H:%M} UTC is in the "
-            f"archive yet; from {cutoff - WITHOUT_WIND_FROM:%H:%M} UTC ENTSO-E's is used "
-            "instead, if it has one, or else the forecast is made without wind"
-        )
     known = honest["forecast_mw"]
     wind_used = {
         "wind_source": "SEMO" if have_wind else None,
@@ -228,14 +229,50 @@ def versions() -> dict:
     return found
 
 
+def wind_input(meta: dict) -> str:
+    """Which of WIND_INPUTS a forecast was made with, from its .json. (Forecasts saved
+    before `wind_source` was recorded all had SEMO's.)"""
+    if meta.get("wind_forecast_published_utc") is None:
+        return "none"
+    return "SEMO" if meta.get("wind_source") in (None, "SEMO") else "ENTSO-E"
+
+
+def saved_meta(day: date, out: Path) -> dict | None:
+    """The .json of the forecast already saved for `day` in `out`, if there is one."""
+    info = out / f"{day}.json"
+    return json.loads(info.read_text()) if info.exists() else None
+
+
+def can_improve(saved: dict, now) -> bool:
+    """Could a forecast made `now` still replace `saved`? Only before the cut-off, and
+    only if `saved` lacks SEMO's wind forecast."""
+    return now < pd.Timestamp(saved["cutoff_utc"]) and wind_input(saved) != WIND_INPUTS[-1]
+
+
+def better(meta: dict, saved: dict) -> bool:
+    """Is `meta`'s wind input better than `saved`'s, and is it still before the cut-off?"""
+    return can_improve(saved, pd.Timestamp(meta["made_at_utc"])) and WIND_INPUTS.index(
+        wind_input(meta)
+    ) > WIND_INPUTS.index(wind_input(saved))
+
+
 def save(table: pd.DataFrame, meta: dict, out: Path) -> tuple[Path, Path]:
-    """Write the day's two files. Refuses if that day already has a forecast."""
+    """Write the day's two files. If the day already has a forecast, replaces it only if
+    this one is better (see `better`), listing the one it replaced in `replaced`."""
     out.mkdir(parents=True, exist_ok=True)
     csv, info = out / f"{meta['day']}.csv", out / f"{meta['day']}.json"
     if csv.exists() or info.exists():
-        raise FileExistsError(
-            f"{meta['day']} already has a forecast in {out}; it is never replaced"
-        )
+        saved = saved_meta(meta["day"], out)
+        if saved is None or not better(meta, saved):
+            raise FileExistsError(
+                f"{meta['day']} already has a forecast in {out}; it is replaced only before "
+                "the cut-off, by one with a better wind input"
+            )
+        meta = {
+            **meta,
+            "replaced": saved.get("replaced", [])
+            + [{"made_at_utc": saved["made_at_utc"], "wind_input": wind_input(saved)}],
+        }
     table.to_csv(csv, index=False, float_format="%.2f", date_format="%Y-%m-%dT%H:%MZ")
     info.write_text(json.dumps(meta, indent=2, allow_nan=False) + "\n")
     return csv, info
@@ -253,17 +290,37 @@ def main() -> None:
     parser.add_argument("--day", type=date.fromisoformat, help="delivery day (default: tomorrow)")
     parser.add_argument("--out", type=Path, required=True, help="folder to save the forecast in")
     parser.add_argument("--data-dir", type=Path, default=DATA_DIR, help="isem-data's data folder")
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="only say whether there's work to do: exit 0 if so, 3 if the saved forecast stands",
+    )
     args = parser.parse_args()
     day = args.day or tomorrow_in_ireland()
     out = args.out.expanduser()
-    if (out / f"{day}.csv").exists():
+    saved = saved_meta(day, out)
+    if saved is not None and not can_improve(saved, pd.Timestamp.now(tz="UTC")):
         print(f"{day} already has a forecast in {out}; nothing to do")
+        sys.exit(3 if args.check else 0)
+    if args.check:
+        print(f"{day}: " + ("no forecast yet" if saved is None else "can still be improved"))
         return
     try:
         table, meta = make(day, args.data_dir.expanduser())
     except NotReady as reason:
         sys.exit(f"Not ready to forecast {day}: {reason}")
+    if saved is not None and not better(meta, saved):
+        print(
+            f"{day}: the saved forecast ({wind_input(saved)} wind) stands; this one has no "
+            f"better wind input ({wind_input(meta)})"
+        )
+        return
     csv, _ = save(table, meta, out)
+    if saved is not None:
+        print(
+            f"{day}: replaced the forecast made {saved['made_at_utc']} "
+            f"({wind_input(saved)} wind) with one using {wind_input(meta)} wind"
+        )
     late = "" if meta["in_time"] else f" (LATE: after the {meta['cutoff_utc']} cut-off)"
     medians = table.groupby("method")["median"].mean().reindex(METHODS)
     print(f"{day}: saved {csv}{late}")
