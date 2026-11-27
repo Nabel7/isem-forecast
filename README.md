@@ -47,9 +47,11 @@ pip install -e ".[foundation,gbm]"
 python -m isem_forecast.live --out forecasts/     # tomorrow's prices, from the archive as it stands now
 ```
 
-Everything above looks back. `live.py` makes the forecast for real: run each morning before the 09:00 UTC cut-off, it writes `<day>.csv` (every half-hour: Chronos-2 + wind and LightGBM + wind with their 80% ranges, and `yesterday` and `week_average` as the bar to beat) and `<day>.json` (when it was made, whether that was before the cut-off, and exactly which prices and wind forecast went in). A day's forecast, once saved, is never replaced. It takes about 15 seconds.
+Everything above looks back. `live.py` makes the forecast for real: run each morning before the 09:00 UTC cut-off, it writes `<day>.csv` (every half-hour: Chronos-2 + wind and LightGBM + wind with their 80% ranges, and `yesterday` and `week_average` as the bar to beat) and `<day>.json` (when it was made, whether that was before the cut-off, and exactly which prices and wind forecast went in). It takes about 15 seconds.
 
-If no wind forecast for the day is in the archive, it waits ("not ready") until three hours before the cut-off, in case SEMO lists one in time, and from then on saves the forecast without it: the two wind models are left empty and listed in the `.json`, and `yesterday` and `week_average` are still saved. Such a day is shown but never counts towards the score. This first happened for 24 Nov 2026, when SEMO had listed no new wind forecast for two and a half days.
+If SEMO's wind forecast for the day isn't in the archive, it uses ENTSO-E's instead (values first seen by then, scaled to SEMO's level), and if neither is there it saves the forecast without wind: the two wind models are left empty and listed in the `.json`, and `yesterday` and `week_average` are still saved. A day without wind is shown but never counts towards the score.
+
+**Save early, replace later.** GitHub starts the overnight runs hours late, at times no one can predict, so the first run that can make a forecast saves one straight away, whatever wind input it has. A later run before the cut-off replaces it only if its wind input is better (none, then ENTSO-E's, then SEMO's); the `.json` lists what it replaced (`replaced`). Which forecast stands is decided by the input alone, never by the prices forecast, and nothing is replaced after the cut-off. `--check` says whether a run has anything to do. (The rule before this waited for SEMO until three hours before the cut-off; on 26 Nov 2026 no run came in those hours, and 27 Nov got no forecast.)
 
 Two things are different live from the tests, both measured on the wind test's days (Sep to Nov 2026, about 70 days):
 
